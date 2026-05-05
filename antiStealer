@@ -14,86 +14,91 @@ local env = getgenv and getgenv() or _G
 local environmentSafe = true
 local detectionReason = ""
 
--- Функция для глубокого анализа подозрительных функций
-local function isFunctionCompromised(func, funcName)
-    if type(func) ~= "function" then return false end
-
-    -- 1. Проверка через ishooked (если экзекьютор поддерживает)
-    if type(ishooked) == "function" and ishooked(func) then
-        return true, "Explicit hook detected on " .. funcName
-    end
-
-    -- 2. Стандартная проверка на LClosure
-    if type(iscclosure) == "function" and not iscclosure(func) then
-        return true, "LClosure detected on " .. funcName
-    end
-    if type(islclosure) == "function" and islclosure(func) then
-        return true, "LClosure detected on " .. funcName
-    end
-
-    -- 3. ГЛУБОКАЯ ПРОВЕРКА: Анализ через debug.getinfo (самая надежная)
-    -- Если функция перехвачена через продвинутый hookfunction, debug.getinfo часто выдает её Lua-происхождение
-    if type(debug) == "table" and type(debug.getinfo) == "function" then
-        local success, info = pcall(debug.getinfo, func)
-        if success and type(info) == "table" then
-            -- Если функция не отмечена как написанная на C
-            if info.what ~= "C" then
-                return true, "debug.what mismatch on " .. funcName
-            end
-            -- Если источник функции не является C-кодом (обычно "=[C]")
-            if info.source and not string.match(info.source, "%[C%]") then
-                return true, "debug.source mismatch on " .. funcName
-            end
+-- =========================================================
+-- V3: Метод ловушки через ошибку (Traceback Analysis)
+-- =========================================================
+local function testViaErrorTrap(func, funcName)
+    local trace = ""
+    
+    -- Пытаемся выполнить функцию с заведомо неверным аргументом
+    -- Это заставит внутреннюю C-логику экзекьютора "выплюнуть" ошибку.
+    local success, err = xpcall(function()
+        if string.find(funcName:lower(), "request") then
+            func(123) -- request ожидает таблицу, а мы даем число
+        elseif string.find(funcName:lower(), "http") then
+            func(game, 123) -- HttpGet ожидает строку
+        else
+            func()
         end
+    end, function(msg)
+        -- Ловим ошибку и записываем весь стек вызовов
+        trace = debug.traceback(msg)
+        return msg
+    end)
+
+    -- Если ошибки почему-то нет (функция ничего не вернула на мусорный аргумент),
+    -- значит хук "проглотил" аргумент и даже не передал его в оригинал.
+    if success then
+        return true, "Error trap swallowed by hook on " .. funcName
     end
 
+    -- Анализируем стек. 
+    -- Если функция оригинальная (C++), ошибка идет напрямую.
+    -- Если висит Lua-хук, в стеке засветятся строки типа "[string", "chunk" или ".lua"
+    -- перед тем, как вызов дойдет до ядра экзекьютора.
+    if string.find(trace, "%[string") or string.find(trace, "%.lua") or string.find(trace, "chunk") then
+        -- Исключаем наш собственный скрипт из проверки (если мы тестируем внутри Studio/одного файла)
+        -- Но в экзекьюторе наличие "[string" в функции request — это 100% стиллер.
+        return true, "Hidden Lua traceback detected on " .. funcName
+    end
+    
     return false, ""
 end
 
--- Собираем список критических функций, проверяя их напрямую из getgenv(), 
--- чтобы избежать чтения кэшированных локальных переменных
+-- =========================================================
+-- Проверка количества Upvalues
+-- =========================================================
+-- hookfunction часто сохраняет оригинальную функцию как upvalue (свободную переменную).
+-- Чистые C-функции экзекьютора обычно не имеют upvalues.
+local function checkUpvalues(func, funcName)
+    if type(debug) == "table" and type(debug.getupvalues) == "function" then
+        local success, upvalues = pcall(debug.getupvalues, func)
+        if success and type(upvalues) == "table" then
+            -- Если у базовой функции внезапно появились внутренние переменные
+            local count = 0
+            for k, v in pairs(upvalues) do count = count + 1 end
+            if count > 0 then
+                return true, "Unexpected upvalues ("..count..") found on " .. funcName
+            end
+        end
+    end
+    return false, ""
+end
+
+-- Собираем цели
 local targetsToInspect = {
-    ["request"] = env.request,
-    ["http_request"] = env.http_request,
-    ["HttpGet"] = game.HttpGet,
-    ["HttpGetAsync"] = game.HttpGetAsync,
-    ["HttpPost"] = game.HttpPost,
-    ["HttpPostAsync"] = game.HttpPostAsync
+    ["request"] = env.request or request,
+    ["http_request"] = env.http_request or http_request,
+    ["HttpGet"] = game.HttpGet
 }
 
--- Проверяем глобальные функции
+print("[Anti-Stealer V3] Running deep trace analysis...")
+
 for name, func in pairs(targetsToInspect) do
-    if func then
-        local isCompromised, reason = isFunctionCompromised(func, name)
+    if type(func) == "function" then
+        -- 1. Проверка через стек ошибок (самая мощная)
+        local isCompromised, reason = testViaErrorTrap(func, name)
         if isCompromised then
             environmentSafe = false
             detectionReason = reason
             break
         end
-    end
-end
 
--- Проверяем метатаблицу game (защита от перехвата game:HttpGet через __namecall)
-if environmentSafe and type(getrawmetatable) == "function" then
-    local mt = getrawmetatable(game)
-    if mt and mt.__namecall then
-        local isCompromised, reason = isFunctionCompromised(mt.__namecall, "game.__namecall")
+        -- 2. Проверка "внутренностей" (Upvalues)
+        isCompromised, reason = checkUpvalues(func, name)
         if isCompromised then
-            -- Некоторые безопасные UI-библиотеки тоже хукают __namecall. 
-            -- Если крашит чистую игру, закомментируй эти три строки.
             environmentSafe = false
             detectionReason = reason
-        end
-    end
-end
-
--- Проверяем наличие мусорных глобальных переменных от известных стиллеров
-if environmentSafe then
-    local suspiciousGlobals = {"StealerLog", "Webhook", "IsHooked", "SendToWebhook"}
-    for _, glob in ipairs(suspiciousGlobals) do
-        if env[glob] ~= nil then
-            environmentSafe = false
-            detectionReason = "Suspicious global variable detected: " .. glob
             break
         end
     end
@@ -101,7 +106,7 @@ end
 
 -- Итог
 if not environmentSafe then
-    warn("[Anti-Stealer] " .. detectionReason)
+    warn("[Anti-Stealer V3] " .. detectionReason)
     triggerAntiStealer(detectionReason)
     return 
 end
