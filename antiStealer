@@ -2,7 +2,7 @@
 local Players = game:GetService("Players")
 local LocalPlayer = Players.LocalPlayer
 
-local function triggerAntiStealer(reason)
+local function kickPlayer(reason)
     if LocalPlayer then
         LocalPlayer:Kick("Security Alert: " .. reason .. "\nGet official script from Discord.")
     end
@@ -10,105 +10,126 @@ local function triggerAntiStealer(reason)
     while true do end
 end
 
-local env = getgenv and getgenv() or _G
+-- Твой официальный вебхук или домен (чтобы скрипт не забанил сам себя)
+local SAFE_URLS = {
+    "duskandshine.xyz",
+    "maximchinazesov-beep", -- твой гитхаб из лоадера
+    -- "discord.com/api/webhooks/ТВОЙ_ОФИЦИАЛЬНЫЙ_ВЕБХУК" 
+}
+
 local environmentSafe = true
-local detectionReason = ""
+local detectReason = ""
 
 -- =========================================================
--- V3: Метод ловушки через ошибку (Traceback Analysis)
+-- Сканирование Garbage Collector (Памяти)
 -- =========================================================
-local function testViaErrorTrap(func, funcName)
-    local trace = ""
-    
-    -- Пытаемся выполнить функцию с заведомо неверным аргументом
-    -- Это заставит внутреннюю C-логику экзекьютора "выплюнуть" ошибку.
-    local success, err = xpcall(function()
-        if string.find(funcName:lower(), "request") then
-            func(123) -- request ожидает таблицу, а мы даем число
-        elseif string.find(funcName:lower(), "http") then
-            func(game, 123) -- HttpGet ожидает строку
-        else
-            func()
-        end
-    end, function(msg)
-        -- Ловим ошибку и записываем весь стек вызовов
-        trace = debug.traceback(msg)
-        return msg
-    end)
-
-    -- Если ошибки почему-то нет (функция ничего не вернула на мусорный аргумент),
-    -- значит хук "проглотил" аргумент и даже не передал его в оригинал.
-    if success then
-        return true, "Error trap swallowed by hook on " .. funcName
+-- Любой скрипт, загруженный через loadstring, или любой вебхук, 
+-- отправленный через request, оседает в памяти Lua в виде строк, 
+-- пока сборщик мусора их не удалит (а удаляет он их не сразу).
+local function scanMemory()
+    if type(getgc) ~= "function" then
+        return false, "Executor doesn't support getgc (memory scan)"
     end
 
-    -- Анализируем стек. 
-    -- Если функция оригинальная (C++), ошибка идет напрямую.
-    -- Если висит Lua-хук, в стеке засветятся строки типа "[string", "chunk" или ".lua"
-    -- перед тем, как вызов дойдет до ядра экзекьютора.
-    if string.find(trace, "%[string") or string.find(trace, "%.lua") or string.find(trace, "chunk") then
-        -- Исключаем наш собственный скрипт из проверки (если мы тестируем внутри Studio/одного файла)
-        -- Но в экзекьюторе наличие "[string" в функции request — это 100% стиллер.
-        return true, "Hidden Lua traceback detected on " .. funcName
-    end
+    print("[Anti-Stealer] Scanning memory...")
     
-    return false, ""
-end
-
--- =========================================================
--- Проверка количества Upvalues
--- =========================================================
--- hookfunction часто сохраняет оригинальную функцию как upvalue (свободную переменную).
--- Чистые C-функции экзекьютора обычно не имеют upvalues.
-local function checkUpvalues(func, funcName)
-    if type(debug) == "table" and type(debug.getupvalues) == "function" then
-        local success, upvalues = pcall(debug.getupvalues, func)
-        if success and type(upvalues) == "table" then
-            -- Если у базовой функции внезапно появились внутренние переменные
-            local count = 0
-            for k, v in pairs(upvalues) do count = count + 1 end
-            if count > 0 then
-                return true, "Unexpected upvalues ("..count..") found on " .. funcName
+    -- Получаем все объекты в памяти (строки, таблицы, функции)
+    local gc = getgc(true)
+    for i = 1, #gc do
+        local v = gc[i]
+        
+        -- Ищем подозрительные СТРОКИ в памяти
+        if type(v) == "string" then
+            -- 1. Поиск чужих Discord вебхуков
+            if string.find(v, "discord%.com/api/webhooks") then
+                local isSafe = false
+                for _, safeUrl in ipairs(SAFE_URLS) do
+                    if string.find(v, safeUrl) then
+                        isSafe = true
+                        break
+                    end
+                end
+                
+                if not isSafe then
+                    return true, "Foreign webhook found in memory!"
+                end
+            end
+            
+            -- 2. Поиск типичных сигнатур стиллеров, которые они прячут в коде
+            local suspiciousStrings = {
+                "Tsuo", "Stealer", "W-e-b-h-o-o-k", "GetGlobalUser", "Token_Grabber"
+            }
+            for _, sig in ipairs(suspiciousStrings) do
+                if string.find(v, sig) then
+                    return true, "Malicious signature found in memory: " .. sig
+                end
             end
         end
     end
+    
     return false, ""
 end
 
--- Собираем цели
-local targetsToInspect = {
-    ["request"] = env.request or request,
-    ["http_request"] = env.http_request or http_request,
-    ["HttpGet"] = game.HttpGet
-}
-
-print("[Anti-Stealer V3] Running deep trace analysis...")
-
-for name, func in pairs(targetsToInspect) do
-    if type(func) == "function" then
-        -- 1. Проверка через стек ошибок (самая мощная)
-        local isCompromised, reason = testViaErrorTrap(func, name)
-        if isCompromised then
-            environmentSafe = false
-            detectionReason = reason
-            break
+-- =========================================================
+-- Проверка Registry (Реестра Lua)
+-- =========================================================
+-- Лоадеры и стиллеры часто сохраняют свои потоки (threads) или функции в реестр.
+local function scanRegistry()
+    if type(getreg) ~= "function" then return false, "" end
+    
+    local reg = getreg()
+    for k, v in pairs(reg) do
+        if type(v) == "string" and string.find(v, "discord%.com/api/webhooks") then
+            -- Аналогичная проверка на чужие вебхуки в реестре
+             local isSafe = false
+             for _, safeUrl in ipairs(SAFE_URLS) do
+                 if string.find(v, safeUrl) then isSafe = true; break end
+             end
+             if not isSafe then
+                 return true, "Foreign webhook found in Registry!"
+             end
         end
+    end
+    return false, ""
+end
 
-        -- 2. Проверка "внутренностей" (Upvalues)
-        isCompromised, reason = checkUpvalues(func, name)
-        if isCompromised then
+-- =========================================================
+-- Запуск проверок
+-- =========================================================
+
+-- 1. Проверяем память
+local isCompromised, reason = scanMemory()
+if isCompromised then
+    environmentSafe = false
+    detectReason = reason
+end
+
+-- 2. Проверяем реестр
+if environmentSafe then
+    isCompromised, reason = scanRegistry()
+    if isCompromised then
+        environmentSafe = false
+        detectReason = reason
+    end
+end
+
+-- 3. Базовая проверка чистоты глобальной среды (поиск левых переменных)
+if environmentSafe then
+    local env = getgenv and getgenv() or _G
+    for k, _ in pairs(env) do
+        if type(k) == "string" and (string.match(k:lower(), "stealer") or string.match(k:lower(), "webhook")) then
             environmentSafe = false
-            detectionReason = reason
+            detectReason = "Suspicious global variable: " .. k
             break
         end
     end
 end
 
--- Итог
 if not environmentSafe then
-    warn("[Anti-Stealer V3] " .. detectionReason)
-    triggerAntiStealer(detectionReason)
-    return 
+    warn("[Anti-Stealer] " .. detectReason)
+    kickPlayer(detectReason)
+    return
 end
 
-print("All safe, loading...")
+print("All safe, loading.")
+-- Дальше идет запуск твоего UI или основной логики
