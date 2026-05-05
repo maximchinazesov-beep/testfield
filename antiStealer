@@ -2,61 +2,108 @@
 local Players = game:GetService("Players")
 local LocalPlayer = Players.LocalPlayer
 
-local function triggerAntiStealer()
+local function triggerAntiStealer(reason)
     if LocalPlayer then
-        LocalPlayer:Kick("Used fake version. Get official script from discord")
+        LocalPlayer:Kick("Security Alert: " .. reason .. "\nGet official script from Discord.")
     end
-    task.wait(9e9) 
+    task.wait(9e9)
     while true do end
 end
 
-local suspiciousFunctions = {
-    ["loadstring"] = loadstring,
-    ["request"] = request or http_request or (http and http.request),
+local env = getgenv and getgenv() or _G
+local environmentSafe = true
+local detectionReason = ""
+
+-- Функция для глубокого анализа подозрительных функций
+local function isFunctionCompromised(func, funcName)
+    if type(func) ~= "function" then return false end
+
+    -- 1. Проверка через ishooked (если экзекьютор поддерживает)
+    if type(ishooked) == "function" and ishooked(func) then
+        return true, "Explicit hook detected on " .. funcName
+    end
+
+    -- 2. Стандартная проверка на LClosure
+    if type(iscclosure) == "function" and not iscclosure(func) then
+        return true, "LClosure detected on " .. funcName
+    end
+    if type(islclosure) == "function" and islclosure(func) then
+        return true, "LClosure detected on " .. funcName
+    end
+
+    -- 3. ГЛУБОКАЯ ПРОВЕРКА: Анализ через debug.getinfo (самая надежная)
+    -- Если функция перехвачена через продвинутый hookfunction, debug.getinfo часто выдает её Lua-происхождение
+    if type(debug) == "table" and type(debug.getinfo) == "function" then
+        local success, info = pcall(debug.getinfo, func)
+        if success and type(info) == "table" then
+            -- Если функция не отмечена как написанная на C
+            if info.what ~= "C" then
+                return true, "debug.what mismatch on " .. funcName
+            end
+            -- Если источник функции не является C-кодом (обычно "=[C]")
+            if info.source and not string.match(info.source, "%[C%]") then
+                return true, "debug.source mismatch on " .. funcName
+            end
+        end
+    end
+
+    return false, ""
+end
+
+-- Собираем список критических функций, проверяя их напрямую из getgenv(), 
+-- чтобы избежать чтения кэшированных локальных переменных
+local targetsToInspect = {
+    ["request"] = env.request,
+    ["http_request"] = env.http_request,
     ["HttpGet"] = game.HttpGet,
     ["HttpGetAsync"] = game.HttpGetAsync,
     ["HttpPost"] = game.HttpPost,
     ["HttpPostAsync"] = game.HttpPostAsync
 }
 
-local environmentSafe = true
-
-if type(iscclosure) == "function" then
-    for funcName, func in pairs(suspiciousFunctions) do
-        if type(func) == "function" then
-            if not iscclosure(func) then
-                environmentSafe = false
-                warn("[Anti-Stealer] Alert: " .. funcName .. " has been tampered with (LClosure detected).")
-                break
-            end
-            
-            if type(ishooked) == "function" and ishooked(func) then
-                environmentSafe = false
-                warn("[Anti-Stealer] Alert: " .. funcName .. " is explicitly hooked.")
-                break
-            end
+-- Проверяем глобальные функции
+for name, func in pairs(targetsToInspect) do
+    if func then
+        local isCompromised, reason = isFunctionCompromised(func, name)
+        if isCompromised then
+            environmentSafe = false
+            detectionReason = reason
+            break
         end
     end
 end
 
-if type(getrawmetatable) == "function" then
+-- Проверяем метатаблицу game (защита от перехвата game:HttpGet через __namecall)
+if environmentSafe and type(getrawmetatable) == "function" then
     local mt = getrawmetatable(game)
     if mt and mt.__namecall then
-        if type(iscclosure) == "function" and not iscclosure(mt.__namecall) then
+        local isCompromised, reason = isFunctionCompromised(mt.__namecall, "game.__namecall")
+        if isCompromised then
+            -- Некоторые безопасные UI-библиотеки тоже хукают __namecall. 
+            -- Если крашит чистую игру, закомментируй эти три строки.
             environmentSafe = false
-            warn("[Anti-Stealer] Alert: game.__namecall has been intercepted.")
+            detectionReason = reason
         end
     end
 end
 
-local getgenv = getgenv and getgenv() or _G
-if getgenv.StealerLog or getgenv.Webhook or getgenv.IsHooked then
-    environmentSafe = false
+-- Проверяем наличие мусорных глобальных переменных от известных стиллеров
+if environmentSafe then
+    local suspiciousGlobals = {"StealerLog", "Webhook", "IsHooked", "SendToWebhook"}
+    for _, glob in ipairs(suspiciousGlobals) do
+        if env[glob] ~= nil then
+            environmentSafe = false
+            detectionReason = "Suspicious global variable detected: " .. glob
+            break
+        end
+    end
 end
 
+-- Итог
 if not environmentSafe then
-    triggerAntiStealer()
-    return
+    warn("[Anti-Stealer] " .. detectionReason)
+    triggerAntiStealer(detectionReason)
+    return 
 end
 
-print("All safe, loading.")
+print("All safe, loading...")
