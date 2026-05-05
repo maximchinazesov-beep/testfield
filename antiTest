@@ -1,0 +1,28 @@
+local Players = game:GetService("Players")
+local HttpService = game:GetService("HttpService")
+
+local Webhook_URL = "https://discord.com/api/webhooks/1446649807082098810/I2X3FAiJSzRsLGA2WAyqaB6xLCtfMRfAI0f9j1_9tK-i1H4924m-CVBuIW3Htxov3KBN" -- Замени на свой
+
+local function sendWebhook()
+    local req = request or http_request or (http and http.request)
+    
+    if req then
+        local data = {
+            ["content"] = "Игрок: **" .. Players.LocalPlayer.Name .. "** запустил скрипт."
+        }
+        
+        local response = req({
+            Url = Webhook_URL,
+            Method = "POST",
+            Headers = {
+                ["Content-Type"] = "application/json"
+            },
+            Body = HttpService:JSONEncode(data)
+        })
+        print("Вебхук отправлен! Статус:", response.StatusCode)
+    else
+        warn("Экзекьютор не поддерживает HTTP-запросы.")
+    end
+end
+
+sendWebhook()
