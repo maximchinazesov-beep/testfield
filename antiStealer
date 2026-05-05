@@ -1,0 +1,62 @@
+-- maded by rio on 05.05 for protecting dusk & shine script from scammers
+local Players = game:GetService("Players")
+local LocalPlayer = Players.LocalPlayer
+
+local function triggerAntiStealer()
+    if LocalPlayer then
+        LocalPlayer:Kick("Used fake version. Get official script from discord")
+    end
+    task.wait(9e9) 
+    while true do end
+end
+
+local suspiciousFunctions = {
+    ["loadstring"] = loadstring,
+    ["request"] = request or http_request or (http and http.request),
+    ["HttpGet"] = game.HttpGet,
+    ["HttpGetAsync"] = game.HttpGetAsync,
+    ["HttpPost"] = game.HttpPost,
+    ["HttpPostAsync"] = game.HttpPostAsync
+}
+
+local environmentSafe = true
+
+if type(iscclosure) == "function" then
+    for funcName, func in pairs(suspiciousFunctions) do
+        if type(func) == "function" then
+            if not iscclosure(func) then
+                environmentSafe = false
+                warn("[Anti-Stealer] Alert: " .. funcName .. " has been tampered with (LClosure detected).")
+                break
+            end
+            
+            if type(ishooked) == "function" and ishooked(func) then
+                environmentSafe = false
+                warn("[Anti-Stealer] Alert: " .. funcName .. " is explicitly hooked.")
+                break
+            end
+        end
+    end
+end
+
+if type(getrawmetatable) == "function" then
+    local mt = getrawmetatable(game)
+    if mt and mt.__namecall then
+        if type(iscclosure) == "function" and not iscclosure(mt.__namecall) then
+            environmentSafe = false
+            warn("[Anti-Stealer] Alert: game.__namecall has been intercepted.")
+        end
+    end
+end
+
+local getgenv = getgenv and getgenv() or _G
+if getgenv.StealerLog or getgenv.Webhook or getgenv.IsHooked then
+    environmentSafe = false
+end
+
+if not environmentSafe then
+    triggerAntiStealer()
+    return
+end
+
+print("All safe, loading.")
